@@ -1,0 +1,18 @@
+# railway.toml
+# ─────────────────────────────────────────────────────────────
+# Railway deployment configuration for ResearchFlow.
+# Docs: https://docs.railway.app/reference/config-as-code
+# ─────────────────────────────────────────────────────────────
+
+[build]
+# Use the Dockerfile in the repo root
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Port must match what uvicorn listens on
+startCommand = "python -m uvicorn api:app --host 0.0.0.0 --port 8000 --workers 1"
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

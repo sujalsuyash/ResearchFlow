@@ -1,0 +1,41 @@
+# .dockerignore
+# Prevents these files from being sent to Docker build context
+
+# Secrets — never bake into image
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Git
+.git/
+.gitignore
+
+# Local model cache (will be re-downloaded during build)
+models/
+.cache/
+
+# Test files
+tests/
+*.test.py
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output reports
+*.md
+!README.md
