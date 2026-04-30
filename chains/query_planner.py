@@ -54,9 +54,8 @@ Usage
 
 import asyncio
 import logging
-import re
 from typing import Literal
-
+from core.filter import _tokenise
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
@@ -67,7 +66,7 @@ logger = logging.getLogger(__name__)
 # Diversity-enforcement constants
 # ---------------------------------------------------------------------------
 
-SIMILARITY_THRESHOLD  = 0.35   # Jaccard similarity ceiling — above this = too similar
+SIMILARITY_THRESHOLD  = 0.30   # Jaccard similarity ceiling — above this = too similar
 MAX_STEPS             = 4      # hard cap on steps generated
 MIN_STEPS             = 2      # minimum accepted steps before early-stop is allowed
 MAX_RETRIES_PER_SLOT  = 3      # LLM retry attempts per step slot before giving up
@@ -119,7 +118,10 @@ class SearchStep(BaseModel):
             "The precise query string to pass to the tool, written in the vocabulary "
             "researchers in this sub-field use in paper titles and abstracts. "
             "The query must be tightly scoped to the `angle` above — "
-            "avoid generic terms that would match papers from other steps' angles."
+            "avoid generic terms that would match papers from other steps' angles. "
+            "CRITICAL: Use only plain alphanumeric characters, spaces, and hyphens. "
+            "Never use apostrophes, quotes, or any special characters. "
+            "Academic search engines do not require possessive forms or punctuation."
         )
     )
     rationale: str = Field(
@@ -147,59 +149,28 @@ class ResearchPlan(BaseModel):
         )
     )
 
-
-# ---------------------------------------------------------------------------
-# Jaccard similarity — deterministic query diversity guard
-# ---------------------------------------------------------------------------
-
-_STOP_WORDS: frozenset[str] = frozenset({
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-    "have", "has", "had", "do", "does", "did", "will", "would", "could",
-    "should", "may", "might", "can", "its", "it", "this", "that", "not",
-    "use", "using", "used", "based", "novel", "new", "study", "paper",
-    "approach", "method", "methods", "analysis", "review", "research",
-    "towards", "via", "among", "across", "about", "two", "three",
-})
-
-
-def _tokenise(text: str) -> frozenset[str]:
-    """Lowercase, strip punctuation, remove stop-words. Min token length: 3."""
-    tokens = re.findall(r"[a-zA-Z]{3,}", text.lower())
-    return frozenset(t for t in tokens if t not in _STOP_WORDS)
-
-
-def _jaccard(a: str, b: str) -> float:
-    """
-    Jaccard similarity between two query strings.
-    Returns 0.0 for empty inputs; 1.0 for identical token sets.
-    """
+def _jaccard(a: str, b: str, anchor_tokens: frozenset[str] | None = None) -> float:
     ta, tb = _tokenise(a), _tokenise(b)
+    if anchor_tokens:
+        ta = ta - anchor_tokens
+        tb = tb - anchor_tokens
     if not ta or not tb:
         return 0.0
-    return len(ta & tb) / len(ta | tb)
+    return len(ta & tb) / len(ta | tb)    
 
-
-def _is_too_similar(candidate: SearchStep, accepted: list[SearchStep]) -> tuple[bool, float, str]:
-    """
-    Compare candidate.search_query against every accepted step's search_query.
-
-    Returns
-    -------
-    (too_similar: bool, max_similarity: float, conflicting_query: str)
-        too_similar       True if any pair exceeds SIMILARITY_THRESHOLD
-        max_similarity    highest Jaccard score found
-        conflicting_query the accepted query that triggered the rejection (or "")
-    """
+def _is_too_similar(
+    candidate: SearchStep,
+    accepted: list[SearchStep],
+    anchor_tokens: frozenset[str] | None = None,
+) -> tuple[bool, float, str]:
     max_sim = 0.0
     conflict = ""
     for step in accepted:
-        sim = _jaccard(candidate.search_query, step.search_query)
+        sim = _jaccard(candidate.search_query, step.search_query, anchor_tokens)
         if sim > max_sim:
             max_sim = sim
             conflict = step.search_query
     return (max_sim >= SIMILARITY_THRESHOLD, max_sim, conflict)
-
 
 # ---------------------------------------------------------------------------
 # Tool catalogue (shared between both prompt templates)
@@ -320,7 +291,18 @@ DOMAIN ROUTING REMINDER
 pubmed_search = biomedical literature ONLY. Never route CS/ML queries there.
 arxiv_search  = CS/ML/physics preprints. Best for fast-moving technical angles.
 
-Respond ONLY with the structured step — no preamble, no explanation outside the schema."""
+Respond ONLY with the structured step — no preamble, no explanation outside the schema.
+
+DOMAIN APPROPRIATENESS RULE
+───────────────────────────
+Only propose dimensions that make sense for the query's field.
+For CS/ML/physics queries: do NOT propose "Economic / Policy Impact"
+or "Epidemiology / Prevalence" — searches for these return nothing useful.
+For biomedical queries: do NOT propose "Dataset & Benchmark Analysis"
+or "Computational / ML angle" unless the query explicitly involves modelling.
+If you would not find papers at this exact intersection in a real DB, pick
+a different dimension.
+"""
 
 STEP_PROMPT = ChatPromptTemplate.from_messages([
     ("system", _NEXT_STEP_SYSTEM),
@@ -344,6 +326,16 @@ to an already-accepted query. You must produce a replacement step that covers
 a DIFFERENT research dimension with DIFFERENT vocabulary.
 
 {_TOOL_DESCRIPTIONS}
+
+DOMAIN APPROPRIATENESS RULE
+───────────────────────────
+Only propose dimensions that make sense for the query's field.
+For CS/ML/physics queries: do NOT propose "Economic / Policy Impact"
+or "Epidemiology / Prevalence" — searches for these return nothing useful.
+For biomedical queries: do NOT propose "Dataset & Benchmark Analysis"
+or "Computational / ML angle" unless the query explicitly involves modelling.
+If you would not find papers at this exact intersection in a real DB, pick
+a different dimension.
 
 Respond ONLY with the structured step — no preamble."""
 
@@ -460,8 +452,8 @@ def generate_plan(
         mutually distinct by the Jaccard guard.
     """
     logger.debug("Generating research plan (sequential) for query: %r", user_query)
-
     accepted: list[SearchStep] = []
+    anchor_tokens = _tokenise(user_query)
 
     for slot in range(max_steps):
         rejected_step:      SearchStep | None = None
@@ -476,7 +468,7 @@ def generate_plan(
                 conflicting_query = rejected_conflict,
             )
 
-            too_similar, sim, conflict = _is_too_similar(step, accepted)
+            too_similar, sim, conflict = _is_too_similar(step, accepted, anchor_tokens)
 
             if not too_similar:
                 # ── Accepted ────────────────────────────────────────────────
@@ -507,16 +499,8 @@ def generate_plan(
             )
 
         # Early-stop: if we have enough steps and the topic seems exhausted
-        if len(accepted) >= min_steps and len(accepted) >= (slot + 1):
-            # Check whether the last slot was actually accepted
-            # If we failed to accept anything for this slot, the topic may be
-            # narrow enough that we're done
-            if len(accepted) < slot + 1:
-                logger.debug(
-                    "Early stop: %d step(s) accepted, slot %d produced nothing.",
-                    len(accepted), slot + 1,
-                )
-                break
+        if len(accepted) < slot + 1 and len(accepted) >= min_steps:
+            break
 
     if not accepted:
         raise RuntimeError(

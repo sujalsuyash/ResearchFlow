@@ -23,6 +23,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from pydantic import BaseModel, Field, field_validator
+import logging
+logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Data models
@@ -184,7 +186,7 @@ def _format_papers_for_prompt(papers: list[PaperResult]) -> str:
         ]
         if p.abstract:
             # Trim very long abstracts to keep prompt size manageable
-            abstract = p.abstract[:800] + "…" if len(p.abstract) > 600 else p.abstract
+            abstract = p.abstract[:800] + "…" if len(p.abstract) > 800 else p.abstract
             lines.append(f"    Abstract: {abstract}")
         if p.url:
             lines.append(f"    URL     : {p.url}")

@@ -11,54 +11,63 @@ Architecture
 ────────────
 Layer 1 — Quality pre-checks  (pure Python, zero cost)
     Drops papers with no title+abstract, stub titles, raw blobs, or years
-    before effective_min_year. Catches completely unparsable tool output
-    immediately. The effective_min_year is auto-raised per field when the
-    caller has not overridden min_year:
+    before effective_min_year. The effective_min_year is auto-raised per
+    field when the caller has not overridden min_year:
         CS / ML    → 2018  (field moves fast; pre-2018 work is rarely relevant)
         General    → 2015  (safe default for tech-adjacent topics)
         Biomedical → 1980  (clinical literature stays relevant for decades)
 
-Layer 2 — Lexical overlap  (zero cost, instant)
-    Tokenises the user query and each paper's title+abstract. Papers with
-    insufficient shared content words between query tokens and paper tokens
-    are dropped.
-
-    lexical_min_overlap is a RATIO (0.0–1.0). It is converted to a required
-    integer count ONCE before the loop:
-        required_overlap = ceil(len(query_tokens) × lexical_min_overlap)
-    At the default of 0.65, a 10-token query requires 7 shared words.
-    A second-chance check against title+abstract combined requires one
-    additional word beyond the primary threshold.
-
-Layer 3 — Semantic similarity  (local model, no API calls)
+Layer 2 — Semantic similarity  (local model, no API calls)
     Embeds the query and each paper's title+abstract using
     sentence-transformers/all-MiniLM-L6-v2 (80 MB, CPU-friendly).
     Papers whose cosine similarity falls below effective_semantic_threshold
-    are dropped.
+    are dropped. Runs BEFORE lexical so the embedding model judges all
+    quality-passed papers, not a pre-screened subset.
 
-    For broad multi-topic queries (detected via _is_broad_query()), the
-    effective threshold is automatically raised by +0.10 (capped at 0.50)
-    to compensate for the diffuse embedding space produced by wide queries.
+    Domain detection uses the same embedding model — the query is compared
+    against three prototype sentences (cs / biomedical / general) by cosine
+    similarity. No keyword arrays. When the top two domain scores are within
+    0.05 of each other the query is treated as cross-domain and the semantic
+    threshold is auto-raised by +0.10 (capped at 0.50).
+
+Layer 3 — Lexical safety net  (zero cost, instant)
+    Hard-drops only papers with zero content-word overlap with the query
+    (expanded with planner sub_queries). This is a last-resort noise guard,
+    not a primary relevance gate.
 
 Layer 4 — Citation-weighted reranking  (pure maths, zero cost)
     Survivors are re-scored by:
-        final_score = semantic_sim × log(citation_count + 2) × recency_weight
-    Recency weight decays exponentially with paper age; half-life is
-    field-aware (CS: 4 yrs, biomedical: 10 yrs, general: 7 yrs).
+        final_score = semantic_sim
+                      × log(citation_count + 2)
+                      × recency_weight
+                      × (1 + lexical_boost)
+    lexical_boost adds up to +0.20 for papers with strong token overlap
+    without hard-dropping papers that score well semantically but use
+    different vocabulary. Recency weight decays exponentially; half-life
+    is field-aware (CS: 4 yrs, biomedical: 10 yrs, general: 7 yrs).
     The top `max_papers` are returned in descending score order.
 
 Graceful degradation
 ────────────────────
-If sentence-transformers is not installed, Layer 3 is skipped with a
-warning and only Layers 1, 2, and 4 run. Install with:
-    pip install sentence-transformers
+If sentence-transformers is not installed, Layer 2 is skipped with a
+warning and only Layers 1, 3, and 4 run. Domain detection falls back to
+"general" when the model is unavailable.
 
-Usage
-─────
-    from core.filter import RelevanceFilter
+Public API
+──────────
+    from core.filter import RelevanceFilter, detect_domain_semantic
 
+    # Domain detection (shared with research_agent.py)
+    domain = detect_domain_semantic("CRISPR gene editing cancer therapy")
+    # → "biomedical"
+
+    # Full filter pipeline
     f = RelevanceFilter(max_papers=25, semantic_threshold=0.30)
-    result = f.run(query="sepsis prediction ICU machine learning", papers=raw)
+    result = f.run(
+        query="sepsis prediction ICU machine learning",
+        papers=raw,
+        sub_queries=["ICU mortality prediction", "sepsis early warning"],
+    )
     clean_papers = result.papers
     print(result.summary())
 """
@@ -76,6 +85,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ── Stop-words excluded from lexical overlap scoring ─────────────────────────
+# Deliberately excludes domain-significant terms like "analysis",
+# "classification", "detection" — these carry real meaning in academic
+# queries and must not be silently stripped.
 _STOP_WORDS: frozenset[str] = frozenset({
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
@@ -83,12 +95,11 @@ _STOP_WORDS: frozenset[str] = frozenset({
     "could", "should", "may", "might", "shall", "can", "its", "it", "this",
     "that", "these", "those", "not", "no", "nor", "so", "yet", "both",
     "either", "neither", "such", "as", "than", "then", "when", "where",
-    "which", "who", "whom", "how", "what", "why", "whether", "if", "use",
-    "using", "used", "based", "novel", "new", "study", "paper", "approach",
-    "method", "methods", "analysis", "review", "research", "towards",
-    "toward", "via", "among", "across", "through", "during", "between",
-    "into", "about", "after", "before", "within", "without", "over",
-    "under", "above", "below", "two", "three", "four", "five",
+    "which", "who", "whom", "how", "what", "why", "whether", "if",
+    "novel", "new", "paper", "towards", "toward", "via", "among",
+    "across", "through", "during", "between", "into", "about", "after",
+    "before", "within", "without", "over", "under", "above", "below",
+    "two", "three", "four", "five",
 })
 
 # ── Prefixes emitted by the normaliser for completely unparsable blobs ────────
@@ -98,28 +109,58 @@ _RAW_BLOB_PREFIXES: tuple[str, ...] = ("Raw: ", "raw: ")
 _CURRENT_YEAR: int = datetime.now().year
 
 # ── Per-field recency half-lives (years) ─────────────────────────────────────
+# These are stable real-world constants — not vocabulary lists.
+# CS literature goes stale in ~4 years; clinical literature stays relevant
+# for decades. These values won't need updating as fields evolve.
 _FIELD_HALF_LIVES: dict[str, int] = {
     "biomedical": 10,
     "cs":          4,
     "general":     7,
 }
 
-# ── Auto min_year floors (Issue 2) ───────────────────────────────────────────
-# Applied only when the caller has not overridden min_year (i.e. it equals
-# DEFAULT_MIN_YEAR). Set an explicit min_year to bypass auto-detection.
+# ── Auto min_year floors ──────────────────────────────────────────────────────
+# Same reasoning: these describe time constants, not vocabulary.
 DEFAULT_MIN_YEAR: int = 1980
 _AUTO_MIN_YEAR: dict[str, int] = {
-    "cs":          2018,   # pre-2018 ML/CS is rarely useful for current queries
-    "general":     2015,   # safe tech-adjacent floor
-    "biomedical":  1980,   # clinical lit stays relevant for decades — no floor raised
+    "cs":          2015,
+    "biomedical":  1980,
+    "general":     2012,
 }
 
-# ── Broad-query signals for auto threshold elevation (Issue 3) ────────────────
-_BROAD_QUERY_SIGNALS: tuple[str, ...] = (
-    "and the role", "and how", "impact of", "influence of",
-    "role of", "relationship between", "comparison of",
-    "effect of", "applications of", "use of",
-)
+# ── Domain prototype sentences for semantic domain detection ──────────────────
+# Three short descriptive sentences — one per domain. The embedding model
+# compares the query against all three and picks the closest by cosine
+# similarity. No keyword arrays needed; the model handles vocabulary
+# variation, synonyms, and cross-domain queries automatically.
+#
+# Updating: only needed if you add a new domain (e.g. "legal", "physics").
+# Rephrasing individual sentences rarely improves results — the model is
+# robust to wording variation at this level of abstraction.
+_DOMAIN_PROTOTYPES: dict[str, str] = {
+    "cs": (
+        "machine learning deep learning neural networks artificial intelligence "
+        "computer vision natural language processing transformers reinforcement "
+        "learning algorithms data science software systems"
+    ),
+    "biomedical": (
+        "clinical trials patient health disease treatment drug therapy cancer "
+        "genomics medical diagnosis surgery hospital epidemiology vaccine "
+        "pharmacology biomarker protein cell biology"
+    ),
+    "general": (
+        "social science economics history policy humanities education law "
+        "philosophy literature psychology sociology political science "
+        "environmental science physics chemistry engineering"
+    ),
+}
+
+# ── Cross-domain detection threshold ─────────────────────────────────────────
+# When the top two domain similarity scores are within this gap, the query
+# spans multiple domains and gets full tool fan-out + raised semantic threshold.
+_CROSS_DOMAIN_GAP: float = 0.08
+
+# ── Maximum lexical boost added to Layer 4 score ─────────────────────────────
+_MAX_LEXICAL_BOOST: float = 0.20
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -140,11 +181,13 @@ class FilterResult:
     kept : int
         len(papers)
     layer_stats : dict[str, int]
-        Per-layer drop counts. Keys: "quality", "lexical", "semantic".
+        Per-layer drop counts. Keys: "quality", "semantic", "lexical".
     elapsed_s : float
         Wall-clock seconds for the entire filter pass.
     semantic_available : bool
-        Whether the sentence-transformers model was available (Layer 3).
+        Whether the sentence-transformers model was available (Layer 2).
+    detected_domain : str
+        Domain inferred from the query: "cs", "biomedical", or "general".
     """
 
     papers:             list[dict[str, Any]]
@@ -153,14 +196,16 @@ class FilterResult:
     layer_stats:        dict[str, int]  = field(default_factory=dict)
     elapsed_s:          float           = 0.0
     semantic_available: bool            = False
+    detected_domain:    str             = "general"
 
     def summary(self) -> str:
         sem = "on" if self.semantic_available else "OFF (pip install sentence-transformers)"
         return (
             f"Filter: {self.kept} kept, {self.dropped} dropped "
             f"[quality={self.layer_stats.get('quality', 0)} "
-            f"lexical={self.layer_stats.get('lexical', 0)} "
-            f"semantic={self.layer_stats.get('semantic', 0)}] "
+            f"semantic={self.layer_stats.get('semantic', 0)} "
+            f"lexical={self.layer_stats.get('lexical', 0)}] "
+            f"domain={self.detected_domain} "
             f"semantic_layer={sem} "
             f"({self.elapsed_s:.2f}s)"
         )
@@ -200,7 +245,7 @@ def _get_embedding_model() -> Any:
     except ImportError:
         logger.warning(
             "RelevanceFilter: sentence-transformers not installed — "
-            "Layer 3 (semantic similarity) SKIPPED. "
+            "Layer 2 (semantic similarity) and domain detection SKIPPED. "
             "Run: pip install sentence-transformers"
         )
         _MODEL_UNAVAILABLE = True
@@ -208,10 +253,136 @@ def _get_embedding_model() -> Any:
 
     except Exception as exc:
         logger.warning(
-            "RelevanceFilter: model load failed (%s) — Layer 3 SKIPPED.", exc
+            "RelevanceFilter: model load failed (%s) — Layer 2 SKIPPED.", exc
         )
         _MODEL_UNAVAILABLE = True
         return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Semantic domain detection  (public — imported by research_agent.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_domain_semantic(query: str) -> str:
+    """
+    Classify *query* into "cs", "biomedical", or "general" using the
+    embedding model — no keyword arrays.
+
+    The query embedding is compared against three domain prototype sentences
+    by cosine similarity. When the top two domain scores are within
+    _CROSS_DOMAIN_GAP (0.05) of each other, the query spans multiple domains
+    and "general" is returned — which triggers full four-tool fan-out in the
+    Research Agent and a raised semantic threshold in the filter.
+
+    Falls back to "general" if the embedding model is unavailable.
+
+    Returns
+    ───────
+    "cs"         — primarily computer science / ML / AI
+    "biomedical" — primarily clinical / life sciences
+    "general"    — cross-domain or neither of the above
+    """
+    model = _get_embedding_model()
+    if model is None:
+        logger.debug("detect_domain_semantic: model unavailable — returning 'general'")
+        return "general"
+
+    try:
+        domain_names  = list(_DOMAIN_PROTOTYPES.keys())
+        prototype_texts = list(_DOMAIN_PROTOTYPES.values())
+
+        q_emb = model.encode([query], normalize_embeddings=True)
+        p_emb = model.encode(prototype_texts, normalize_embeddings=True)
+
+        sims = (p_emb @ q_emb.T).flatten().tolist()
+
+        # Sort domain indices by similarity descending
+        ranked = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)
+        best_domain = domain_names[ranked[0]]
+        best_score  = sims[ranked[0]]
+        second_score = sims[ranked[1]] if len(ranked) > 1 else 0.0
+
+        gap = best_score - second_score
+
+        logger.debug(
+            "detect_domain_semantic: query=%r best=%s(%.3f) second=%s(%.3f) gap=%.3f",
+            query[:60], best_domain, best_score,
+            domain_names[ranked[1]] if len(ranked) > 1 else "n/a",
+            second_score, gap,
+        )
+
+        if gap < _CROSS_DOMAIN_GAP:
+            logger.debug(
+                "detect_domain_semantic: gap %.3f < %.3f → cross-domain → 'general'",
+                gap, _CROSS_DOMAIN_GAP,
+            )
+            return "general"
+
+        return best_domain
+
+    except Exception as exc:
+        logger.warning("detect_domain_semantic: failed (%s) — returning 'general'", exc)
+        return "general"
+
+def detect_domain_semantic_multi(queries: list[str]) -> str:
+    """
+    Classify domain from a list of planner-generated search queries rather
+    than the raw user query. Aggregates cosine similarity scores across all
+    queries and picks by averaged signal.
+
+    This is more reliable than classifying the raw user query because the
+    planner decomposes vague umbrella terms ("artificial intelligence") into
+    specific sub-queries whose vocabulary maps more cleanly to a domain.
+
+    Falls back to "general" if the model is unavailable or queries is empty.
+    """
+    if not queries:
+        return "general"
+
+    model = _get_embedding_model()
+    if model is None:
+        return "general"
+
+    try:
+        domain_names    = list(_DOMAIN_PROTOTYPES.keys())
+        prototype_texts = list(_DOMAIN_PROTOTYPES.values())
+
+        p_emb  = model.encode(prototype_texts, normalize_embeddings=True)
+        scores = [0.0] * len(domain_names)
+
+        for q in queries:
+            q_emb = model.encode([q], normalize_embeddings=True)
+            sims  = (p_emb @ q_emb.T).flatten().tolist()
+            for i, s in enumerate(sims):
+                scores[i] += s
+
+        # Average across all sub-queries
+        scores = [s / len(queries) for s in scores]
+
+        ranked      = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        best_domain = domain_names[ranked[0]]
+        gap         = scores[ranked[0]] - scores[ranked[1]]
+
+        logger.debug(
+            "detect_domain_semantic_multi: queries=%d best=%s gap=%.3f scores=%s",
+            len(queries), best_domain, gap,
+            {domain_names[i]: f"{scores[i]:.3f}" for i in range(len(scores))},
+        )
+
+        if gap < _CROSS_DOMAIN_GAP:
+            logger.debug(
+                "detect_domain_semantic_multi: gap %.3f < %.3f → cross-domain → 'general'",
+                gap, _CROSS_DOMAIN_GAP,
+            )
+            return "general"
+
+        return best_domain
+
+    except Exception as exc:
+        logger.warning(
+            "detect_domain_semantic_multi: failed (%s) — returning 'general'", exc
+        )
+        return "general"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -225,7 +396,7 @@ def _tokenise(text: str) -> frozenset[str]:
 
 
 def _paper_embed_text(paper: dict[str, Any]) -> str:
-    """Build the string embedded for semantic scoring. Title is doubled to up-weight it."""
+    """Build the string embedded for semantic scoring. Title doubled to up-weight it."""
     title    = (paper.get("title")    or "").strip()
     abstract = (paper.get("abstract") or "").strip()[:600]
     return f"{title}. {title}. {abstract}"
@@ -242,62 +413,38 @@ def _recency_weight(year: int | None, half_life: int, min_weight: float) -> floa
     return min_weight + (1.0 - min_weight) * (0.5 ** (age / half_life))
 
 
+def _lexical_boost(
+    query_tokens: frozenset[str],
+    paper: dict[str, Any],
+    max_boost: float = _MAX_LEXICAL_BOOST,
+) -> float:
+    """
+    Returns a [0, max_boost] additive score bonus based on token overlap.
+    Used in Layer 4 reranking — not as a hard filter gate.
+    """
+    title_tokens    = _tokenise(paper.get("title")    or "")
+    abstract_tokens = _tokenise(paper.get("abstract") or "")
+    combined        = title_tokens | abstract_tokens
+
+    if not query_tokens or not combined:
+        return 0.0
+
+    overlap_ratio = len(query_tokens & combined) / len(query_tokens)
+    return min(overlap_ratio, 1.0) * max_boost
+
+
 def _rank_score(
     sim: float,
     citation_count: int | None,
     year: int | None,
     half_life: int,
     min_recency: float,
+    lex_boost: float,
 ) -> float:
-    """Combined relevance × authority × recency score used for Layer 4."""
+    """Combined relevance × authority × recency × lexical score for Layer 4."""
     cit = math.log(max(0, citation_count or 0) + 2)
     rec = _recency_weight(year, half_life, min_recency)
-    return sim * cit * rec
-
-
-def _detect_field(query: str) -> str:
-    """
-    Lightweight domain detector.
-    Returns 'biomedical', 'cs', or 'general'.
-    Used to select recency half-life and effective min_year automatically.
-    """
-    q = query.lower()
-    bio_hits = sum(1 for kw in (
-        "drug", "clinical", "patient", "disease", "therapy", "cancer",
-        "gene", "protein", "cell", "medical", "health", "virus",
-        "vaccine", "genomic", "dna", "rna", "pharmacol", "pathogen",
-        "mutation", "tumor", "tumour", "biomarker", "trial", "surgery",
-        "diagnosis", "prognosis", "epidemic", "treatment", "hospital",
-    ) if kw in q)
-
-    cs_hits = sum(1 for kw in (
-        "machine learning", "deep learning", "neural network",
-        "transformer", "language model", "llm", "reinforcement learning",
-        "computer vision", "nlp", "natural language", "artificial intelligence",
-        "diffusion model", "retrieval", "graph network", "autoencoder",
-        "attention mechanism", "fine-tuning", "embedding", "multimodal",
-        "fusion", "classification", "dataset",
-    ) if kw in q)
-
-    if bio_hits > cs_hits:
-        return "biomedical"
-    if cs_hits > bio_hits:
-        return "cs"
-    return "general"
-
-
-def _is_broad_query(query: str) -> bool:
-    """
-    Return True when the query spans multiple topics or domains.
-
-    Broad queries produce diffuse embedding spaces — a topic like
-    "AI in strategic decisions AND augmented reality in e-commerce"
-    makes the query centroid land between both topics, so papers from
-    either topic score lower than expected. Raising the semantic threshold
-    compensates by requiring stronger per-paper relevance signal.
-    """
-    q = query.lower()
-    return any(signal in q for signal in _BROAD_QUERY_SIGNALS)
+    return sim * cit * rec * (1.0 + lex_boost)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -306,34 +453,30 @@ def _is_broad_query(query: str) -> bool:
 
 class RelevanceFilter:
     """
-    Four-layer relevance filter: quality → lexical → semantic → rerank.
+    Four-layer relevance filter: quality → semantic → lexical → rerank.
+
+    Domain classification uses the embedding model (no keyword arrays).
+    When a query spans multiple domains the semantic threshold is
+    automatically raised to compensate for diffuse query embeddings.
 
     Parameters
     ──────────
     max_papers : int
         Maximum papers returned after Layer 4 reranking (default 25).
     semantic_threshold : float
-        Cosine similarity floor for Layer 3 (default 0.30).
-        For broad multi-topic queries this is automatically raised by +0.10
-        (capped at 0.50) to compensate for diffuse query embeddings.
-    lexical_min_overlap : float
-        Fraction (0.0–1.0) of query content-tokens that must appear in the
-        paper's title or title+abstract to pass Layer 2 (default 0.65).
-        Converted to a required integer count at run time:
-            required = ceil(len(query_tokens) × lexical_min_overlap)
-        Set to 0.0 to disable lexical filtering entirely.
+        Cosine similarity floor for Layer 2 (default 0.30).
+        Auto-raised by +0.10 (capped at 0.50) for cross-domain queries.
     min_year : int
-        Papers published before this year are dropped (default 1980).
-        When left at the default, the filter auto-raises the floor by field:
-            CS / ML → 2018,  General → 2015,  Biomedical → 1980.
-        Pass an explicit year to override auto-detection entirely.
+        Papers before this year are dropped (default 1980).
+        Auto-raised by field: CS/ML → 2018, General → 2015, Biomedical → 1980.
+        Pass an explicit year to override auto-detection.
     min_recency_weight : float
         Floor for the recency decay multiplier (default 0.40).
     auto_field : bool
-        When True (default), detects domain from query and adjusts the
+        When True (default), uses semantic domain detection to adjust
         recency half-life and min_year automatically.
     recency_half_life : int | None
-        Manually override the half-life in years. Overrides auto_field.
+        Manually override the half-life in years.
     """
 
     def __init__(
@@ -341,19 +484,17 @@ class RelevanceFilter:
         *,
         max_papers:           int        = 25,
         semantic_threshold:   float      = 0.30,
-        lexical_min_overlap:  float      = 0.65,
         min_year:             int        = DEFAULT_MIN_YEAR,
         min_recency_weight:   float      = 0.40,
         auto_field:           bool       = True,
         recency_half_life:    int | None = None,
     ) -> None:
-        self.max_papers           = max_papers
-        self.semantic_threshold   = semantic_threshold
-        self.lexical_min_overlap  = lexical_min_overlap
-        self.min_year             = min_year
-        self.min_recency_weight   = min_recency_weight
-        self.auto_field           = auto_field
-        self._override_half_life  = recency_half_life
+        self.max_papers          = max_papers
+        self.semantic_threshold  = semantic_threshold
+        self.min_year            = min_year
+        self.min_recency_weight  = min_recency_weight
+        self.auto_field          = auto_field
+        self._override_half_life = recency_half_life
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -372,31 +513,44 @@ class RelevanceFilter:
             The original user research question.
         papers : list[dict]
             Raw paper dicts from the Research Agent (post-dedup, pre-filter).
+        sub_queries : list[str] | None
+            Planner-generated sub-questions. Used to expand the lexical
+            vocabulary. Always pass these from the pipeline for best results.
 
         Returns
         ───────
         FilterResult
-            .papers     — filtered and reranked list (at most max_papers)
-            .summary()  — one-line human-readable stats string
+            .papers          — filtered and reranked list (at most max_papers)
+            .detected_domain — domain inferred from query
+            .summary()       — one-line human-readable stats string
         """
         t0 = time.perf_counter()
-        layer_stats: dict[str, int] = {"quality": 0, "lexical": 0, "semantic": 0}
+        layer_stats: dict[str, int] = {"quality": 0, "semantic": 0, "lexical": 0}
 
-        # ── Resolve field, half-life, effective_min_year ──────────────────────
-        field_name = _detect_field(query) if self.auto_field else "general"
+        # ── Domain detection via embedding model (no keyword arrays) ──────────
+        # detect_domain_semantic returns "general" for cross-domain queries,
+        # which triggers full fan-out AND a raised semantic threshold below.
+        if self.auto_field:
+            if sub_queries:
+                field_name = detect_domain_semantic_multi(sub_queries)
+            else:
+                field_name = detect_domain_semantic(query)
+        else:
+            field_name = "general"
+
         half_life  = self._override_half_life or _FIELD_HALF_LIVES.get(field_name, 7)
 
-        # Issue 2: auto-raise min_year when caller left it at the default value
         if self.min_year == DEFAULT_MIN_YEAR and self.auto_field:
             effective_min_year = _AUTO_MIN_YEAR.get(field_name, DEFAULT_MIN_YEAR)
         else:
-            effective_min_year = self.min_year   # caller explicitly overrode it
+            effective_min_year = self.min_year
 
-        # Issue 3: raise semantic threshold for broad multi-topic queries
-        if _is_broad_query(query):
+        # Cross-domain queries ("general") produce diffuse embeddings — raise
+        # the threshold so we require stronger per-paper relevance signal.
+        if field_name == "general":
             effective_threshold = min(self.semantic_threshold + 0.10, 0.50)
             logger.debug(
-                "RelevanceFilter: broad query detected — semantic threshold "
+                "RelevanceFilter: cross-domain query — semantic threshold "
                 "raised %.2f → %.2f",
                 self.semantic_threshold, effective_threshold,
             )
@@ -404,7 +558,7 @@ class RelevanceFilter:
             effective_threshold = self.semantic_threshold
 
         logger.debug(
-            "RelevanceFilter: field=%s half_life=%d effective_min_year=%d "
+            "RelevanceFilter: domain=%s half_life=%d effective_min_year=%d "
             "effective_threshold=%.2f",
             field_name, half_life, effective_min_year, effective_threshold,
         )
@@ -415,17 +569,14 @@ class RelevanceFilter:
             title    = (p.get("title")    or "").strip()
             abstract = (p.get("abstract") or "").strip()
 
-            # Drop raw blobs from the normaliser
             if any(title.startswith(pfx) for pfx in _RAW_BLOB_PREFIXES):
                 layer_stats["quality"] += 1
                 continue
 
-            # Must have a title of substance OR a non-trivial abstract
             if len(title) < 10 and len(abstract) < 30:
                 layer_stats["quality"] += 1
                 continue
 
-            # Year floor — uses effective_min_year, not raw self.min_year
             year = p.get("year")
             if year is not None:
                 try:
@@ -446,79 +597,36 @@ class RelevanceFilter:
             len(papers), len(after_quality), layer_stats["quality"],
         )
 
-# ── Layer 2: Lexical overlap ──────────────────────────────────────────
-        # Expand vocabulary using the planner's corrected sub-queries so papers
-        # are matched against field-standard terms, not just the user's raw input.
-        # IMPORTANT: required_overlap is calculated from base_token_count only —
-        # adding sub_queries must not inflate the required overlap threshold.
-        all_query_text  = " ".join(filter(None, [query] + (sub_queries or [])))
-        query_tokens    = _tokenise(all_query_text)
-        base_token_count = len(_tokenise(query))
-
-        after_lexical: list[dict[str, Any]] = []
-
-        if self.lexical_min_overlap <= 0 or not query_tokens:
-            after_lexical = after_quality
-        else:
-            required_overlap = max(1, math.ceil(
-                base_token_count * self.lexical_min_overlap
-            ))
-            logger.debug(
-                "Filter L2: query_tokens=%d base_tokens=%d required_overlap=%d (ratio=%.2f)",
-                len(query_tokens), base_token_count, required_overlap, self.lexical_min_overlap,
-            )
-
-            for p in after_quality:
-                title_tokens    = _tokenise(p.get("title")    or "")
-                abstract_tokens = _tokenise(p.get("abstract") or "")
-
-                # Primary check: title tokens alone
-                if len(query_tokens & title_tokens) >= required_overlap:
-                    after_lexical.append(p)
-                    continue
-
-                # Second chance: title + abstract combined (one extra word required)
-                combined = title_tokens | abstract_tokens
-                if len(query_tokens & combined) >= required_overlap + 1:
-                    after_lexical.append(p)
-                else:
-                    layer_stats["lexical"] += 1
-                    logger.debug(
-                        "Filter L2 drop (lexical): %r",
-                        (p.get("title") or "")[:60],
-                    )
-
-        logger.debug(
-            "Filter L2 (lexical): %d -> %d (%d dropped)",
-            len(after_quality), len(after_lexical), layer_stats["lexical"],
-        )
-
-        # ── Layer 3: Semantic similarity ──────────────────────────────────────
+        # ── Layer 2: Semantic similarity ──────────────────────────────────────
+        # Runs on ALL after_quality papers — not a lexically pre-screened
+        # subset. The embedding model is already loaded for domain detection
+        # so this costs no additional startup time.
         model = _get_embedding_model()
         semantic_available = model is not None
+
         after_semantic: list[tuple[float, dict[str, Any]]] = []
 
-        if model is None or not after_lexical:
-            after_semantic = [(0.5, p) for p in after_lexical]
+        if model is None or not after_quality:
+            after_semantic = [(0.5, p) for p in after_quality]
         else:
             try:
-                corpus = [_paper_embed_text(p) for p in after_lexical]
+                corpus = [_paper_embed_text(p) for p in after_quality]
+                scoring_text = " ".join(sub_queries) if sub_queries else query
                 q_emb  = model.encode(
-                    [query], convert_to_numpy=True, normalize_embeddings=True
+                    [scoring_text], convert_to_numpy=True, normalize_embeddings=True
                 )
                 p_embs = model.encode(
                     corpus, convert_to_numpy=True, normalize_embeddings=True
                 )
                 sims: list[float] = (p_embs @ q_emb.T).flatten().tolist()
 
-                for sim, paper in zip(sims, after_lexical):
-                    # Uses effective_threshold (auto-raised for broad queries)
+                for sim, paper in zip(sims, after_quality):
                     if sim >= effective_threshold:
                         after_semantic.append((sim, paper))
                     else:
                         layer_stats["semantic"] += 1
                         logger.debug(
-                            "Filter L3 drop (semantic=%.3f < %.3f): %r",
+                            "Filter L2 drop (semantic=%.3f < %.3f): %r",
                             sim, effective_threshold,
                             (paper.get("title") or "")[:60],
                         )
@@ -526,24 +634,56 @@ class RelevanceFilter:
             except Exception as exc:
                 logger.warning(
                     "RelevanceFilter: semantic scoring failed (%s) — "
-                    "keeping all lexical survivors.", exc
+                    "keeping all quality survivors.", exc
                 )
-                after_semantic = [(0.5, p) for p in after_lexical]
+                after_semantic = [(0.5, p) for p in after_quality]
 
         logger.debug(
-            "Filter L3 (semantic): %d -> %d (%d dropped)",
-            len(after_lexical), len(after_semantic), layer_stats["semantic"],
+            "Filter L2 (semantic): %d -> %d (%d dropped)",
+            len(after_quality), len(after_semantic), layer_stats["semantic"],
         )
 
-        # ── Layer 4: Citation-weighted reranking ──────────────────────────────
+        # ── Layer 3: Lexical safety net ───────────────────────────────────────
+        # Hard-drops only papers with ZERO content-word overlap with the query.
+        # Vocabulary expanded with sub_queries so field-standard terms count
+        # even when absent from the user's raw input. Required overlap = 1.
+        all_query_text = " ".join(filter(None, [query] + (sub_queries or [])))
+        query_tokens   = _tokenise(all_query_text)
+
+        after_lexical: list[tuple[float, dict[str, Any]]] = []
+
+        if not query_tokens:
+            after_lexical = after_semantic
+        else:
+            for sim, paper in after_semantic:
+                title_tokens    = _tokenise(paper.get("title")    or "")
+                abstract_tokens = _tokenise(paper.get("abstract") or "")
+                combined        = title_tokens | abstract_tokens
+
+                if len(query_tokens & combined) >= 1:
+                    after_lexical.append((sim, paper))
+                else:
+                    layer_stats["lexical"] += 1
+                    logger.debug(
+                        "Filter L3 drop (zero lexical overlap): %r",
+                        (paper.get("title") or "")[:60],
+                    )
+
+        logger.debug(
+            "Filter L3 (lexical): %d -> %d (%d dropped)",
+            len(after_semantic), len(after_lexical), layer_stats["lexical"],
+        )
+
+        # ── Layer 4: Citation-weighted reranking with lexical boost ───────────
         ranked = sorted(
-            after_semantic,
+            after_lexical,
             key=lambda t: _rank_score(
                 sim            = t[0],
                 citation_count = t[1].get("citation_count"),
                 year           = t[1].get("year"),
                 half_life      = half_life,
                 min_recency    = self.min_recency_weight,
+                lex_boost      = _lexical_boost(query_tokens, t[1]),
             ),
             reverse=True,
         )
@@ -559,9 +699,12 @@ class RelevanceFilter:
             layer_stats        = layer_stats,
             elapsed_s          = elapsed,
             semantic_available = semantic_available,
+            detected_domain    = field_name,
         )
         logger.info("RelevanceFilter: %s", result.summary())
         return result
 
+
 def preload_embedding_model() -> None:
-        _get_embedding_model()
+    """Call at server startup to warm the embedding model singleton."""
+    _get_embedding_model()

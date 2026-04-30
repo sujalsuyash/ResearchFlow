@@ -364,8 +364,7 @@ class ResearchPipeline:
 
         relevance_filter = RelevanceFilter(
             max_papers          = agent._max_total_papers,
-            semantic_threshold  = 0.30,
-            lexical_min_overlap = 0.3,
+            semantic_threshold  = 0.33,
         )
         sub_queries = [step.search_query for step in plan.steps]
         filter_result = relevance_filter.run(query=query, papers=enriched, sub_queries=sub_queries)
@@ -379,8 +378,8 @@ class ResearchPipeline:
                 f"{filter_result.kept} kept, "
                 f"{filter_result.dropped} dropped "
                 f"[q={filter_result.layer_stats.get('quality', 0)} "
-                f"lex={filter_result.layer_stats.get('lexical', 0)} "
-                f"sem={filter_result.layer_stats.get('semantic', 0)}]"
+                f"sem={filter_result.layer_stats.get('semantic', 0)} "
+                f"lex={filter_result.layer_stats.get('lexical', 0)}]"
             ),
         })
 
