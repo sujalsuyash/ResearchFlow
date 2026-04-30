@@ -40,14 +40,18 @@ ENV PYTHONUNBUFFERED=1
 ENV TRANSFORMERS_VERBOSITY=error
 
 # ── Port ──────────────────────────────────────────────────────────────────────
-EXPOSE 8000
+# Railway injects $PORT at runtime; default to 8000 for local development.
+ENV PORT=8000
+EXPOSE ${PORT}
 
 # ── Health check ─────────────────────────────────────────────────────────────
-# Docker/Railway will restart the container if /health stops returning 200
+# Docker/Railway will restart the container if /health stops returning 200.
+# Uses $PORT so it matches whatever Railway assigns at runtime.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # ── Start command ─────────────────────────────────────────────────────────────
+# Shell form (not JSON array) so $PORT is expanded at runtime by the shell.
 # Workers=1 keeps memory usage low on free-tier deployments.
 # Increase to 2-4 workers on paid plans for better concurrency.
-CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD python -m uvicorn api:app --host 0.0.0.0 --port ${PORT} --workers 1
