@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # ResearchFlow
 
 **Autonomous academic research agent.** Submit a natural-language question, get back a cited Markdown report grounded in real papers from Semantic Scholar, PubMed, OpenAlex, and arXiv — in under 60 seconds on fresh API keys.
