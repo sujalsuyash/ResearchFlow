@@ -19,7 +19,7 @@ Layer 1 — Quality pre-checks  (pure Python, zero cost)
 
 Layer 2 — Semantic similarity  (local model, no API calls)
     Embeds the query and each paper's title+abstract using
-    sentence-transformers/all-MiniLM-L6-v2 (80 MB, CPU-friendly).
+    fastembed/all-MiniLM-L6-v2 (ONNX runtime, ~160 MB total, CPU-friendly).
     Papers whose cosine similarity falls below effective_semantic_threshold
     are dropped. Runs BEFORE lexical so the embedding model judges all
     quality-passed papers, not a pre-screened subset.
@@ -49,9 +49,8 @@ Layer 4 — Citation-weighted reranking  (pure maths, zero cost)
 
 Graceful degradation
 ────────────────────
-If sentence-transformers is not installed, Layer 2 is skipped with a
-warning and only Layers 1, 3, and 4 run. Domain detection falls back to
-"general" when the model is unavailable.
+If fastembed is not installed, Layer 2 is skipped with a warning and only Layers 1, 3, and 4 run.
+Domain detection falls back to "general" when the model is unavailable.
 
 Public API
 ──────────
@@ -81,6 +80,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +185,7 @@ class FilterResult:
     elapsed_s : float
         Wall-clock seconds for the entire filter pass.
     semantic_available : bool
-        Whether the sentence-transformers model was available (Layer 2).
+        Whether the fastembed model was available (Layer 2).
     detected_domain : str
         Domain inferred from the query: "cs", "biomedical", or "general".
     """
@@ -199,7 +199,7 @@ class FilterResult:
     detected_domain:    str             = "general"
 
     def summary(self) -> str:
-        sem = "on" if self.semantic_available else "OFF (pip install sentence-transformers)"
+        sem = "on" if self.semantic_available else "OFF (pip install fastembed)"
         return (
             f"Filter: {self.kept} kept, {self.dropped} dropped "
             f"[quality={self.layer_stats.get('quality', 0)} "
@@ -220,10 +220,6 @@ _MODEL_UNAVAILABLE: bool = False
 
 
 def _get_embedding_model() -> Any:
-    """
-    Return a cached SentenceTransformer, loading it on first call.
-    Returns None if sentence-transformers is not installed.
-    """
     global _MODEL_CACHE, _MODEL_UNAVAILABLE
 
     if _MODEL_CACHE is not None:
@@ -232,29 +228,18 @@ def _get_embedding_model() -> Any:
         return None
 
     try:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-
-        logger.info(
-            "RelevanceFilter: loading all-MiniLM-L6-v2 (one-time, ~80 MB)..."
-        )
+        from fastembed import TextEmbedding
+        logger.info("RelevanceFilter: loading all-MiniLM-L6-v2 via fastembed (one-time)...")
         t0 = time.perf_counter()
-        _MODEL_CACHE = SentenceTransformer("all-MiniLM-L6-v2")
+        _MODEL_CACHE = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
         logger.info("RelevanceFilter: model ready in %.1fs", time.perf_counter() - t0)
         return _MODEL_CACHE
-
     except ImportError:
-        logger.warning(
-            "RelevanceFilter: sentence-transformers not installed — "
-            "Layer 2 (semantic similarity) and domain detection SKIPPED. "
-            "Run: pip install sentence-transformers"
-        )
+        logger.warning("RelevanceFilter: fastembed not installed — Layer 2 SKIPPED. Run: pip install fastembed")
         _MODEL_UNAVAILABLE = True
         return None
-
     except Exception as exc:
-        logger.warning(
-            "RelevanceFilter: model load failed (%s) — Layer 2 SKIPPED.", exc
-        )
+        logger.warning("RelevanceFilter: model load failed (%s) — Layer 2 SKIPPED.", exc)
         _MODEL_UNAVAILABLE = True
         return None
 
@@ -291,8 +276,8 @@ def detect_domain_semantic(query: str) -> str:
         domain_names  = list(_DOMAIN_PROTOTYPES.keys())
         prototype_texts = list(_DOMAIN_PROTOTYPES.values())
 
-        q_emb = model.encode([query], normalize_embeddings=True)
-        p_emb = model.encode(prototype_texts, normalize_embeddings=True)
+        q_emb = np.array(list(model.embed([query])))
+        p_emb = np.array(list(model.embed(prototype_texts)))
 
         sims = (p_emb @ q_emb.T).flatten().tolist()
 
@@ -347,11 +332,11 @@ def detect_domain_semantic_multi(queries: list[str]) -> str:
         domain_names    = list(_DOMAIN_PROTOTYPES.keys())
         prototype_texts = list(_DOMAIN_PROTOTYPES.values())
 
-        p_emb  = model.encode(prototype_texts, normalize_embeddings=True)
+        p_emb = np.array(list(model.embed(prototype_texts)))
         scores = [0.0] * len(domain_names)
 
         for q in queries:
-            q_emb = model.encode([q], normalize_embeddings=True)
+            q_emb = np.array(list(model.embed([q])))
             sims  = (p_emb @ q_emb.T).flatten().tolist()
             for i, s in enumerate(sims):
                 scores[i] += s
@@ -612,12 +597,8 @@ class RelevanceFilter:
             try:
                 corpus = [_paper_embed_text(p) for p in after_quality]
                 scoring_text = " ".join(sub_queries) if sub_queries else query
-                q_emb  = model.encode(
-                    [scoring_text], convert_to_numpy=True, normalize_embeddings=True
-                )
-                p_embs = model.encode(
-                    corpus, convert_to_numpy=True, normalize_embeddings=True
-                )
+                q_emb  = np.array(list(model.embed([scoring_text])))
+                p_embs = np.array(list(model.embed(corpus)))
                 sims: list[float] = (p_embs @ q_emb.T).flatten().tolist()
 
                 for sim, paper in zip(sims, after_quality):

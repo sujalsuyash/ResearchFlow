@@ -23,7 +23,7 @@ Environment variables
   EMBEDDING_MODEL    Model name / HF repo id
                      (default: sentence-transformers/all-MiniLM-L6-v2)
   MODEL_CACHE_DIR    Where to write the weights
-                     (default: ~/.cache/torch/sentence_transformers)
+                     (default: ~/.cache/fastembed)
   HF_TOKEN          HuggingFace token — raises the anonymous rate limit and
                      enables access to gated models.  Optional for this model.
 """
@@ -47,19 +47,10 @@ CACHE_DIR  = os.getenv("MODEL_CACHE_DIR")
 
 
 def _cache_dir_for_model(model_name: str, cache_root: str | None) -> str:
-    """
-    Return the directory sentence-transformers would use for this model.
-
-    sentence-transformers replaces '/' with '_' in the directory name when
-    using a HuggingFace repo id.
-    """
     if cache_root is None:
-        import torch  # noqa: PLC0415  (optional dep for path resolution)
-        cache_root = os.path.join(torch.hub.get_dir(), "..", "sentence_transformers")
-
+        cache_root = os.path.join(os.path.expanduser("~"), ".cache", "fastembed")
     safe_name = model_name.replace("/", "_").replace("\\", "_")
     return os.path.join(cache_root, safe_name)
-
 
 def _model_appears_cached(model_name: str, cache_root: str | None) -> bool:
     """
@@ -85,13 +76,11 @@ def download(model_name: str = MODEL_NAME, cache_dir: str | None = CACHE_DIR) ->
     logger.info("Downloading model: %s", model_name)
     t0 = time.perf_counter()
 
-    from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-
+    from fastembed import TextEmbedding
     model = SentenceTransformer(model_name)
-
     elapsed = time.perf_counter() - t0
     logger.info("Model loaded in %.1fs — running smoke test …", elapsed)
-
+    
     # Smoke test: encode a single sentence and check the output shape
     embedding = model.encode(["ResearchFlow embedding smoke test"])
     dim = len(embedding[0])
