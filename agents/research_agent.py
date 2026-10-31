@@ -161,7 +161,7 @@ class ResilientLLM(Runnable):
         self,
         groq_keys: list[str],
         gemini_key: str = "",
-        groq_model: str = "llama-3.1-70b-versatile",
+        groq_model: str = "openai/gpt-oss-120b",
         gemini_model: str = "gemini-2.0-flash",
         temperature: float = 0.1,
     ) -> None:
