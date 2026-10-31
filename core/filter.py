@@ -598,7 +598,15 @@ class RelevanceFilter:
                 corpus = [_paper_embed_text(p) for p in after_quality]
                 scoring_text = " ".join(sub_queries) if sub_queries else query
                 q_emb  = np.array(list(model.embed([scoring_text])))
-                p_embs = np.array(list(model.embed(corpus)))
+                
+                # Batch embedding to prevent OOM crash
+                batch_size = 5
+                p_embs_list = []
+                for i in range(0, len(corpus), batch_size):
+                    chunk = corpus[i : i + batch_size]
+                    p_embs_list.extend(list(model.embed(chunk)))
+                p_embs = np.array(p_embs_list)
+                
                 sims: list[float] = (p_embs @ q_emb.T).flatten().tolist()
 
                 for sim, paper in zip(sims, after_quality):
